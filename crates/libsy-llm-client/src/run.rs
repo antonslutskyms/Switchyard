@@ -37,7 +37,7 @@ use switchyard_protocol::{
 };
 use switchyard_translation::prepare_request_for_target;
 
-use crate::observation::{ModelCallObservation, RunObservation, RunObserver};
+use crate::observation::{ClassifierRlObserver, ModelCallObservation, RunObservation, RunObserver};
 use crate::{metrics, observability};
 
 /// Run one request to completion, serving every offloaded model call with `client`.
@@ -60,6 +60,19 @@ pub async fn run(
     models: Arc<RuntimeModels>,
     observer: Option<RunObserver>,
 ) -> Result<(ModelId, Response)> {
+    run_with_classifier_rl_observer(algorithm, clients, request, models, observer, None).await
+}
+
+/// Runs with optional content-bearing classifier training events. Disabled callers
+/// avoid request copies, response serialization, and training-event allocation.
+pub async fn run_with_classifier_rl_observer(
+    algorithm: Arc<dyn Algorithm>,
+    clients: ClientRouter,
+    request: Request,
+    models: Arc<RuntimeModels>,
+    observer: Option<RunObserver>,
+    rl_observer: Option<ClassifierRlObserver>,
+) -> Result<(ModelId, Response)> {
     let algorithm_name = algorithm.name().to_string();
     let run_started = Instant::now();
     let routing_clients = clients.clone();
@@ -71,7 +84,15 @@ pub async fn run(
         None => {
             drive(Arc::clone(&algorithm), request, models, {
                 let routing_observations = routing_observations.clone();
-                move |call| serve(routing_clients.clone(), call, routing_observations.clone())
+                let rl_observer = rl_observer.clone();
+                move |call| {
+                    serve(
+                        routing_clients.clone(),
+                        call,
+                        routing_observations.clone(),
+                        rl_observer.clone(),
+                    )
+                }
             })
             .await
         }
@@ -87,6 +108,13 @@ pub async fn run(
     metrics::record_routing_overhead(&algorithm_name, overhead);
 
     let selected_model_id = outcome.selected_model_id()?.clone();
+    if let Some(log) = &rl_observer {
+        log(
+            json!({"event": "routing_decision", "selected_target": selected_model_id,
+            "candidates": outcome.selected_model_ids, "request": outcome.request.llm_request,
+            "action_probability": null, "reward": null}),
+        );
+    }
     if let Some(observer) = &observer
         && let Some(metadata) = outcome.metadata
     {
@@ -115,6 +143,7 @@ pub async fn run(
             &outcome.candidate_requests,
             &outcome.selected_model_ids,
             &observe,
+            rl_observer.as_ref(),
         )
         .await
         .and_then(|(request, response)| clients.remember_state_owner(request, response))
@@ -201,17 +230,36 @@ pub async fn decide(
     request: Request,
     models: Arc<RuntimeModels>,
 ) -> Result<RoutingOutcome> {
+    decide_with_classifier_rl_observer(algorithm, clients, request, models, None).await
+}
+
+/// Resolves a decision with optional classifier training events, without serving an answer.
+pub async fn decide_with_classifier_rl_observer(
+    algorithm: Arc<dyn Algorithm>,
+    clients: ClientRouter,
+    request: Request,
+    models: Arc<RuntimeModels>,
+    rl_observer: Option<ClassifierRlObserver>,
+) -> Result<RoutingOutcome> {
     let routing_clients = clients.clone();
     let mut outcome = match clients.stored_state_owner(&request) {
         Some(owner) => continue_on(owner, algorithm.name(), request),
         None => {
+            let rl_observer = rl_observer.clone();
             drive(algorithm, request, models, move |call| {
-                serve(routing_clients.clone(), call, None)
+                serve(routing_clients.clone(), call, None, rl_observer.clone())
             })
             .await?
         }
     };
     let selected_model_id = outcome.selected_model_id()?.clone();
+    if let Some(log) = &rl_observer {
+        log(
+            json!({"event": "routing_decision", "selected_target": selected_model_id,
+            "candidates": outcome.selected_model_ids, "request": outcome.request.llm_request,
+            "metadata": outcome.metadata, "action_probability": null, "reward": null}),
+        );
+    }
     outcome.request = clients.prepare_completion_request(outcome.request, &selected_model_id);
     outcome.response = outcome
         .response
@@ -229,13 +277,29 @@ async fn serve_decision(
     clients: &ClientRouter,
     call: CallDecision,
     observations: &Option<Arc<Mutex<Vec<RunObservation>>>>,
+    rl_observer: Option<&ClassifierRlObserver>,
 ) -> Result<()> {
     let client = clients.route_decision(&call.model);
     let model = call.model.clone();
     let request = call.request.clone();
+    let call_id = rl_observer.map(|_| uuid::Uuid::now_v7().to_string());
+    if let Some(log) = rl_observer {
+        log(
+            json!({"event": "call_started", "call_id": call_id, "phase": "decision",
+            "target": model, "request": request}),
+        );
+    }
     call.respond(async {
         let started = Instant::now();
         let result = async { client?.call(request).await }.await;
+        if let Some(log) = rl_observer {
+            log(
+                json!({"event": "call_completed", "call_id": call_id, "phase": "decision",
+                "target": model, "duration_ms": started.elapsed().as_secs_f64() * 1000.0,
+                "response": result.as_ref().ok(), "usage": result.as_ref().ok().map(|r| &r.usage),
+                "error": result.as_ref().err().map(ToString::to_string)}),
+            );
+        }
         tracing::Span::current().record("outcome", if result.is_ok() { "ok" } else { "error" });
         if let Some(observations) = observations {
             observations
@@ -283,10 +347,13 @@ async fn serve(
     clients: ClientRouter,
     call: Call,
     observations: Option<Arc<Mutex<Vec<RunObservation>>>>,
+    rl_observer: Option<ClassifierRlObserver>,
 ) -> Result<()> {
     let call = match call {
         Call::Model(call) => *call,
-        Call::Decision(call) => return serve_decision(&clients, *call, &observations).await,
+        Call::Decision(call) => {
+            return serve_decision(&clients, *call, &observations, rl_observer.as_ref()).await;
+        }
     };
     let observe = |observation| {
         if let Some(observations) = &observations {
@@ -308,11 +375,13 @@ async fn serve(
         0,
         candidates,
         CallPhase::Routing,
+        rl_observer.as_ref(),
     ))
     .await
 }
 
 /// Try candidates in order until one succeeds or a failure stops fallback.
+#[allow(clippy::too_many_arguments)]
 async fn call_first_available<'a>(
     clients: &ClientRouter,
     algorithm: &str,
@@ -321,6 +390,7 @@ async fn call_first_available<'a>(
     candidate_requests: &'a HashMap<ModelId, Request>,
     models: &[ModelId],
     observe: &(dyn Fn(ModelCallObservation) + Send + Sync),
+    rl_observer: Option<&ClassifierRlObserver>,
 ) -> Result<(&'a Request, Response)> {
     for (index, target) in models.iter().enumerate() {
         let request = candidate_requests
@@ -339,6 +409,7 @@ async fn call_first_available<'a>(
             index,
             models.len(),
             CallPhase::Completion,
+            rl_observer,
         )
         .await
         {
@@ -438,7 +509,16 @@ async fn call_one(
     // count is for span log
     count: usize,
     phase: CallPhase,
+    rl_observer: Option<&ClassifierRlObserver>,
 ) -> Result<Response> {
+    let call_id = rl_observer.map(|_| uuid::Uuid::now_v7().to_string());
+    if let Some(log) = rl_observer {
+        log(
+            json!({"event": "call_started", "call_id": call_id, "phase": phase.as_str(),
+            "target": model_id, "algorithm": algorithm, "attempt_index": index,
+            "candidate_count": count, "request": request.llm_request}),
+        );
+    }
     let is_routing = matches!(phase, CallPhase::Routing);
     let span = tracing::Span::current();
     observability::record_gen_ai_request(&span, &request.llm_request);
@@ -454,11 +534,14 @@ async fn call_one(
     let client = clients.route(model_id);
     let started = Instant::now();
     let mut routing_usage = None;
+    let mut routing_response = None;
     let result = async {
         let mut response = client?.call(request).await?;
         if is_routing && let LlmResponse::Stream(chunks) = response.llm_response {
-            let (chunks, usage) = buffer_routing_stream(chunks).await?;
+            let (chunks, usage, aggregate) =
+                buffer_routing_stream(chunks, rl_observer.is_some()).await?;
             routing_usage = usage;
+            routing_response = aggregate;
             response.llm_response = LlmResponse::Stream(chunks);
         }
         Ok(response)
@@ -472,6 +555,16 @@ async fn call_one(
         response
     });
     let result = observability::observe_client_call(result);
+    if let Some(log) = rl_observer {
+        log(
+            json!({"event": "call_completed", "call_id": call_id, "phase": phase.as_str(),
+            "target": model_id, "duration_ms": duration.as_secs_f64() * 1000.0,
+            "response": result.as_ref().ok().and_then(|r| r.llm_response.as_agg()).or(routing_response.as_ref()),
+            "usage": result.as_ref().ok().and_then(|r| r.llm_response.as_agg())
+                .map(|r| &r.usage).or(routing_usage.as_ref()),
+            "error": result.as_ref().err().map(ToString::to_string)}),
+        );
+    }
     let result = if is_routing {
         result
     } else {
@@ -494,11 +587,17 @@ async fn call_one(
 // Routing logs need the final usage, but replay must keep signed provider events intact.
 async fn buffer_routing_stream(
     mut chunks: LlmResponseStream,
-) -> std::result::Result<(LlmResponseStream, Option<Usage>), LlmClientError> {
+    capture_response: bool,
+) -> std::result::Result<(LlmResponseStream, Option<Usage>, Option<AggLlmResponse>), LlmClientError>
+{
+    let mut accumulator = capture_response.then(ResponseAccumulator::new);
     let mut events = Vec::new();
     let mut usage = None;
     while let Some(event) = chunks.try_next().await? {
         for chunk in event.normalized() {
+            if let Some(accumulator) = accumulator.as_mut() {
+                accumulator.push(chunk.clone());
+            }
             match chunk {
                 LlmResponseChunk::Usage(latest) => usage = Some(latest.clone()),
                 LlmResponseChunk::DecodeError { message } => {
@@ -515,7 +614,11 @@ async fn buffer_routing_stream(
         }
         events.push(event);
     }
-    Ok((stream::iter(events.into_iter().map(Ok)).boxed(), usage))
+    Ok((
+        stream::iter(events.into_iter().map(Ok)).boxed(),
+        usage,
+        accumulator.map(ResponseAccumulator::finish),
+    ))
 }
 
 /// Whether a failed candidate is worth routing around.
@@ -1498,14 +1601,38 @@ mod tests {
             assert!(llm.calls.lock().is_empty());
             let events = Arc::new(Mutex::new(Vec::new()));
             let captured = events.clone();
-            let (selected, _) = run(
+            let training_events = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let training_capture = training_events.clone();
+            let (selected, _) = run_with_classifier_rl_observer(
                 algorithm()?,
                 clients,
                 request(),
                 models.clone(),
                 Some(Arc::new(move |event| captured.lock().push(event))),
+                Some(Arc::new(move |event| training_capture.lock().push(event))),
             )
             .await?;
+            {
+                let training = training_events.lock();
+                let input = training
+                    .iter()
+                    .find(|e| e["event"] == "call_started" && e["phase"] == "decision")
+                    .expect("typed classifier input");
+                let output = training
+                    .iter()
+                    .find(|e| e["event"] == "call_completed" && e["phase"] == "decision")
+                    .expect("typed classifier output");
+                assert_eq!(input["call_id"], output["call_id"]);
+                assert!(input["request"]["questions"].is_object());
+                assert_eq!(output["response"].is_object(), is_success);
+                assert_eq!(output["error"].is_null(), is_success);
+                let decision = training
+                    .iter()
+                    .find(|e| e["event"] == "routing_decision")
+                    .expect("routing decision");
+                assert_eq!(decision["selected_target"], expected);
+                assert!(decision["action_probability"].is_null());
+            }
             assert_eq!(selected, expected);
             assert_eq!(&*llm.calls.lock(), &[ModelId::from(expected)]);
             {

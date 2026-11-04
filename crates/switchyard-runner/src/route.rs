@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use libsy::{Algorithm, LibsyError, RoutingOutcome, RuntimeModels};
 use serde_json::Value;
-use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObserver, TranslatingLlmClient};
+use switchyard_llm_client::{
+    AuxiliaryOperation, ClassifierRlObserver, ClientRouter, RunObserver, TranslatingLlmClient,
+};
 use switchyard_protocol::{
     LlmClientError, ModelId, Request, Response, RoutedLlmClient, WireFormat,
 };
@@ -178,6 +180,19 @@ impl Route {
             .cloned()
     }
 
+    /// Returns endpoint identities without credentials for training provenance.
+    pub fn training_targets(&self) -> Vec<Value> {
+        self.decision_targets
+            .iter()
+            .map(|target| {
+                serde_json::json!({
+                    "target": target.target, "model": target.model,
+                    "format": target.format, "base_url": target.base_url,
+                })
+            })
+            .collect()
+    }
+
     /// Returns the models grouped for one algorithm execution.
     pub fn models(&self) -> &RuntimeModels {
         &self.models
@@ -199,12 +214,24 @@ impl Route {
         request: Request,
         observer: Option<RunObserver>,
     ) -> Result<RunOutput, RunnerError> {
-        let (selected_model, response) = switchyard_llm_client::run(
+        self.execute_with_classifier_rl_observer(request, observer, None)
+            .await
+    }
+
+    /// Executes with opt-in content-bearing training events for this request.
+    pub async fn execute_with_classifier_rl_observer(
+        &self,
+        request: Request,
+        observer: Option<RunObserver>,
+        rl_observer: Option<ClassifierRlObserver>,
+    ) -> Result<RunOutput, RunnerError> {
+        let (selected_model, response) = switchyard_llm_client::run_with_classifier_rl_observer(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
             Arc::clone(&self.models),
             observer,
+            rl_observer,
         )
         .await?;
         Ok(RunOutput {
@@ -215,11 +242,21 @@ impl Route {
 
     /// Completes routing-time calls without serving a post-routing completion.
     pub async fn decide(&self, request: Request) -> Result<RoutingOutcome, RunnerError> {
-        switchyard_llm_client::decide(
+        self.decide_with_classifier_rl_observer(request, None).await
+    }
+
+    /// Resolves a decision with optional content-bearing classifier training events.
+    pub async fn decide_with_classifier_rl_observer(
+        &self,
+        request: Request,
+        rl_observer: Option<ClassifierRlObserver>,
+    ) -> Result<RoutingOutcome, RunnerError> {
+        switchyard_llm_client::decide_with_classifier_rl_observer(
             Arc::clone(&self.algorithm),
             self.clients.clone(),
             request,
             Arc::clone(&self.models),
+            rl_observer,
         )
         .await
         .map_err(Into::into)

@@ -18,7 +18,14 @@ if TYPE_CHECKING:
     class Server:
         """Running loopback instance of the native Switchyard server."""
 
-        def __init__(self, config: str | PathLike[str], port: int = 0) -> None: ...
+        def __init__(
+            self, config: str | PathLike[str], port: int = 0, *,
+            enable_classifier_rl_logging: bool = False,
+            classifier_rl_log_file: str | PathLike[str] | None = None,
+            classifier_rl_policy_version: str = "unversioned",
+            routing_log_file: str | PathLike[str] | None = None,
+            pricing_file: str | PathLike[str] | None = None,
+        ) -> None: ...
 
         @property
         def port(self) -> int: ...

@@ -2576,6 +2576,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
  "wiremock",
 ]
 
@@ -2728,6 +2729,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

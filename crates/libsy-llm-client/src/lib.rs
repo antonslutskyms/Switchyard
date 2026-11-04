@@ -36,11 +36,13 @@ mod system_one;
 pub use backend::{Backend, DEFAULT_MAX_RETRIES, HttpBackendConfig};
 pub use client::{AuxiliaryOperation, ModelConfig, TranslatingLlmClient};
 pub use error::{LlmClientError, Result};
-pub use observation::{ModelCallObservation, RunObservation, RunObserver};
+pub use observation::{ClassifierRlObserver, ModelCallObservation, RunObservation, RunObserver};
 pub use openai_decisions::OpenAiDecisionClient;
 pub use raw::RawResponse;
 pub use responses_reasoning::ResponsesReasoningPolicy;
-pub use run::{ClientRouter, decide, run};
+pub use run::{
+    ClientRouter, decide, decide_with_classifier_rl_observer, run, run_with_classifier_rl_observer,
+};
 pub use switchyard_translation::RawEventStream;
 pub use system_one::SystemOneClient;
 

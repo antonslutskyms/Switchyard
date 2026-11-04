@@ -37,11 +37,39 @@ struct PyServer {
 impl PyServer {
     /// Loads a TOML deployment and starts serving it on loopback.
     #[new]
-    #[pyo3(signature = (config, port=0))]
-    fn new(config: PathBuf, port: u16) -> PyResult<Self> {
+    #[pyo3(signature = (config, port=0, *, enable_classifier_rl_logging=false, classifier_rl_log_file=None, classifier_rl_policy_version="unversioned", routing_log_file=None, pricing_file=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        config: PathBuf,
+        port: u16,
+        enable_classifier_rl_logging: bool,
+        classifier_rl_log_file: Option<PathBuf>,
+        classifier_rl_policy_version: &str,
+        routing_log_file: Option<PathBuf>,
+        pricing_file: Option<PathBuf>,
+    ) -> PyResult<Self> {
         initialize_observability().map_err(server_error)?;
-        let state = load_server_state(config)
+        let mut state = load_server_state(config)
             .map_err(|error| ServerConfigError::new_err(error.to_string()))?;
+        if let Some(path) = routing_log_file {
+            state = state.with_routing_log(path).map_err(server_error)?;
+        }
+        if enable_classifier_rl_logging {
+            state = state
+                .with_classifier_rl_logging(
+                    classifier_rl_log_file
+                        .unwrap_or_else(|| PathBuf::from("classifier_rl_data/events.jsonl")),
+                    classifier_rl_policy_version,
+                )
+                .map_err(server_error)?;
+        } else if classifier_rl_log_file.is_some() {
+            return Err(PyValueError::new_err(
+                "classifier_rl_log_file requires enable_classifier_rl_logging",
+            ));
+        }
+        if let Some(path) = pricing_file {
+            state = state.with_pricing_file(path).map_err(server_error)?;
+        }
         let caller_auth_by_model = state
             .models()
             .map(|model| (model.to_string(), state.caller_auth_kind(model)))

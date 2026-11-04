@@ -4,6 +4,7 @@
 //! Rust HTTP server for libsy algorithms.
 
 mod capabilities;
+mod classifier_rl_log;
 pub mod config;
 mod metrics;
 mod observability;
@@ -170,6 +171,7 @@ pub struct ServerState {
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
+    classifier_rl_log: Option<classifier_rl_log::ClassifierRlLog>,
     track_cache_eligibility: bool,
     model_catalog: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>>,
 }
@@ -241,6 +243,7 @@ impl ServerState {
             metrics,
             stats,
             routing_log: None,
+            classifier_rl_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             model_catalog: Arc::default(),
         })
@@ -252,14 +255,34 @@ impl ServerState {
         Ok(self)
     }
 
+    /// Enables content-bearing classifier training events. The version should
+    /// identify the deployed classifier checkpoint and routing policy.
+    pub fn with_classifier_rl_logging(
+        mut self,
+        path: impl AsRef<std::path::Path>,
+        policy_version: impl Into<String>,
+    ) -> ServerResult<Self> {
+        self.classifier_rl_log = Some(classifier_rl_log::ClassifierRlLog::new(
+            path.as_ref(),
+            policy_version.into(),
+        )?);
+        Ok(self)
+    }
+
     /// This method loads rates in USD per million tokens for saved routing records.
-    pub fn with_pricing_file(self, path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+    pub fn with_pricing_file(mut self, path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
         let prices = switchyard_costs::Pricing::load(path.as_ref()).map_err(ServerError::new)?;
-        let log = self
-            .routing_log
-            .as_ref()
-            .ok_or_else(|| ServerError::new("pricing requires a routing log"))?;
-        log.writer.lock().pricing = prices;
+        if self.routing_log.is_none() && self.classifier_rl_log.is_none() {
+            return Err(ServerError::new(
+                "pricing requires routing or classifier RL logging",
+            ));
+        }
+        if let Some(log) = &self.routing_log {
+            log.writer.lock().pricing = prices.clone();
+        }
+        if let Some(log) = &mut self.classifier_rl_log {
+            log.pricing = prices;
+        }
         Ok(self)
     }
 
@@ -767,15 +790,34 @@ async fn decision_inner(
         }
     };
     let input_format = body.input_format;
-    let (route, request) = match resolve_route(
-        &state,
-        metadata_from_headers(headers),
-        body.request,
-        input_format,
-    ) {
+    let mut metadata = metadata_from_headers(headers);
+    if state.classifier_rl_log.is_some() {
+        metadata.extra_metadata.get_or_insert_default().insert(
+            "classifier_rl_decision_id".to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        );
+    }
+    let trace = state
+        .classifier_rl_log
+        .as_ref()
+        .map(|log| log.context(&metadata, state.redactor.clone()));
+    let mut guard = trace.as_ref().map(|t| t.guard());
+    let (route, request) = match resolve_route(&state, metadata, body.request, input_format) {
         Ok(resolved) => resolved,
-        Err(response) => return response,
+        Err(response) => {
+            if let Some(guard) = guard.as_mut() {
+                guard.finish(json!({"event": "execution_completed", "status": "rejected", "http_status": response.status().as_u16(), "reward": null}));
+            }
+            return response;
+        }
     };
+    if let Some(trace) = &trace {
+        trace.emit(
+            json!({"event": "request_started", "route_id": request.llm_request.model,
+            "algorithm": route.algorithm_name(), "request": request.llm_request,
+            "targets": route.training_targets(), "decision_only": true, "reward": null}),
+        );
+    }
     let route_model = request
         .llm_request
         .model
@@ -783,10 +825,23 @@ async fn decision_inner(
         .map(ModelId::from)
         .unwrap_or_default();
 
-    let mut outcome = match route.decide(request).await {
+    let mut outcome = match route
+        .decide_with_classifier_rl_observer(request, trace.as_ref().map(|t| t.observer()))
+        .await
+    {
         Ok(outcome) => outcome,
-        Err(error) => return runner_error(error),
+        Err(error) => {
+            if let Some(guard) = guard.as_mut() {
+                guard.finish(json!({"event": "execution_completed", "status": "error", "error": error.to_string(), "reward": null}));
+            }
+            return runner_error(error);
+        }
     };
+    if let Some(guard) = guard.as_mut() {
+        guard.finish(
+            json!({"event": "execution_completed", "status": "decision_only", "reward": null}),
+        );
+    }
     let response = match outcome.response.take() {
         Some(response) => {
             let aggregate = match response.llm_response.into_agg().await {
@@ -939,7 +994,18 @@ async fn handle_endpoint_inner(
     body: std::result::Result<Json<Value>, JsonRejection>,
     wire_format: WireFormat,
 ) -> Response {
-    let metadata = metadata_from_headers(headers);
+    let mut metadata = metadata_from_headers(headers);
+    if state.classifier_rl_log.is_some() {
+        metadata.extra_metadata.get_or_insert_default().insert(
+            "classifier_rl_decision_id".to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        );
+    }
+    let decision_id = metadata
+        .extra_metadata
+        .as_ref()
+        .and_then(|m| m.get("classifier_rl_decision_id"))
+        .cloned();
     let routing_log_context = state
         .routing_log
         .as_ref()
@@ -983,7 +1049,12 @@ async fn handle_endpoint_inner(
         }
         Err((status, message)) => invalid_body_error(status, message),
     };
-    let response = render_error_response(response, wire_format);
+    let mut response = render_error_response(response, wire_format);
+    if let Some(id) = decision_id.and_then(|id| HeaderValue::from_str(&id).ok()) {
+        response
+            .headers_mut()
+            .insert("x-switchyard-decision-id", id);
+    }
     metrics::record_client_response(response.status().as_u16());
     request_log.emit(&response);
     response
@@ -1090,11 +1161,28 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    let trace = state
+        .classifier_rl_log
+        .as_ref()
+        .map(|log| log.context(&metadata, state.redactor.clone()));
+    let mut trace_guard = trace.as_ref().map(|trace| trace.guard());
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
-        Err(response) => return response,
+        Err(response) => {
+            if let Some(guard) = trace_guard.as_mut() {
+                guard.finish(json!({"event": "execution_completed", "status": "rejected", "http_status": response.status().as_u16(), "reward": null}));
+            }
+            return response;
+        }
     };
+    if let Some(trace) = &trace {
+        trace.emit(
+            json!({"event": "request_started", "route_id": request.llm_request.model,
+            "algorithm": route.algorithm_name(), "request": request.llm_request,
+            "targets": route.training_targets(), "reward": null}),
+        );
+    }
     let routing_log_context = routing_log_context.map(|context| {
         context.with_route(
             request.llm_request.model.as_deref().unwrap_or_default(),
@@ -1108,9 +1196,29 @@ async fn handle_llm_request(
         state.routing_log.clone().zip(routing_log_context.clone()),
     );
 
-    let output = match route.execute(request, Some(observer)).await {
+    let observer = if let Some(trace) = trace.clone() {
+        Arc::new(move |event: RunObservation| {
+            if let RunObservation::Outcome(metadata) = &event {
+                trace.emit(json!({"event": "routing_outcome", "metadata": metadata}));
+            }
+            observer(event);
+        }) as RunObserver
+    } else {
+        observer
+    };
+    let output = match route
+        .execute_with_classifier_rl_observer(
+            request,
+            Some(observer),
+            trace.as_ref().map(|t| t.observer()),
+        )
+        .await
+    {
         Ok(output) => output,
         Err(error) => {
+            if let Some(guard) = trace_guard.as_mut() {
+                guard.finish(json!({"event": "execution_completed", "status": "error", "error": error.to_string(), "reward": null}));
+            }
             if let RunnerError::Algorithm(LibsyError::ClientCall {
                 target,
                 source:
@@ -1147,6 +1255,16 @@ async fn handle_llm_request(
         response
     };
 
+    if let (Some(trace), Some(guard)) = (trace, trace_guard.take()) {
+        response = trace.observe_response(
+            response,
+            served_model
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            guard,
+        );
+    }
     let upstream_headers = std::mem::take(&mut response.upstream_headers);
     let response_model = served_model.as_ref().map(ToString::to_string);
     let mut response = match into_http_response(

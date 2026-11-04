@@ -69,6 +69,7 @@ impl RoutingLog {
             outcome: None,
             cost,
             ts: format_rfc3339_millis(SystemTime::now()).to_string().into(),
+            decision_id: context.decision_id.map(Cow::Owned),
             route_id: context.route_id.into(),
             algorithm: context.algorithm.into(),
             origin: context.origin.map(Cow::Owned),
@@ -102,6 +103,7 @@ impl RoutingLog {
     ) -> std::io::Result<()> {
         self.append_record(&serde_json::json!({
             "session_id": context.session_id,
+            "decision_id": context.decision_id,
             "outcome": LoggedOutcome {
                 ts: format_rfc3339_millis(SystemTime::now()).to_string(),
                 route_id: context.route_id.clone(),
@@ -183,6 +185,7 @@ impl AgentIdentity {
 /// Holds request metadata until route resolution attaches the durable route identity.
 #[derive(Clone)]
 pub(crate) struct RoutingLogContext {
+    decision_id: Option<String>,
     route_id: String,
     algorithm: String,
     origin: Option<String>,
@@ -198,6 +201,11 @@ impl RoutingLogContext {
     pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
         let headers = metadata.http_headers.as_ref();
         Self {
+            decision_id: metadata
+                .extra_metadata
+                .as_ref()
+                .and_then(|m| m.get("classifier_rl_decision_id"))
+                .cloned(),
             route_id: String::new(),
             algorithm: String::new(),
             origin: headers
@@ -233,6 +241,7 @@ impl RoutingLogContext {
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 struct RoutingRecord<'a> {
+    decision_id: Option<Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<LoggedOutcome>,
     #[serde(default)]

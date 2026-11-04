@@ -36,6 +36,9 @@ dependencies = []
 # Install dev tooling with `uv sync` (the `dev` group is uv's default and
 # is installed automatically) or `uv sync --group dev` to be explicit.
 # With pip >= 25.1, use `pip install --group dev .` from a checkout.
+[project.scripts]
+switchyard = "switchyard.cli:main"
+
 [dependency-groups]
 dev = [
     "maturin>=1.9,<2.0",

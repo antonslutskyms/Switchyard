@@ -52,8 +52,28 @@ pub(crate) struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     routing_log_file: Option<PathBuf>,
 
+    /// Record classifier inputs, decisions, and execution results for training.
+    #[arg(long)]
+    enable_classifier_rl_logging: bool,
+
+    /// JSONL training event file. Contains conversation content when enabled.
+    #[arg(
+        long,
+        default_value = "classifier_rl_data/events.jsonl",
+        requires = "enable_classifier_rl_logging"
+    )]
+    classifier_rl_log_file: PathBuf,
+
+    /// Checkpoint or experiment identifier saved with each training event.
+    #[arg(
+        long,
+        default_value = "unversioned",
+        requires = "enable_classifier_rl_logging"
+    )]
+    classifier_rl_policy_version: String,
+
     /// This optional TOML or JSON file replaces the entire bundled table of rates in USD per million tokens.
-    #[arg(long, value_name = "PATH", requires = "routing_log_file")]
+    #[arg(long, value_name = "PATH")]
     pricing_file: Option<PathBuf>,
 
     /// TLS certificate path in PEM format.
@@ -75,6 +95,12 @@ impl ServerArgs {
         let mut state = load_server_state(&self.config)?;
         if let Some(path) = self.routing_log_file {
             state = state.with_routing_log(path)?;
+        }
+        if self.enable_classifier_rl_logging {
+            state = state.with_classifier_rl_logging(
+                self.classifier_rl_log_file,
+                self.classifier_rl_policy_version,
+            )?;
         }
         if let Some(path) = self.pricing_file {
             state = state.with_pricing_file(path)?;

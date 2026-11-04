@@ -6106,3 +6106,147 @@ task_typing = false
     }
     Ok(())
 }
+
+/// Training events must join the classifier's real input/output to execution and
+/// routing accounting, including fail-open decisions and streamed responses.
+#[tokio::test]
+async fn classifier_rl_logging_joins_decisions_responses_and_routing_records() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let directory = tempfile::tempdir()?;
+    let trace_path = directory.path().join("training/events.jsonl");
+    let routing_path = directory.path().join("routing.jsonl");
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.local]
+format = "openai_chat"
+base_url = "{}"
+[targets.classifier]
+id = "model/classifier"
+llm_client = "local"
+[targets.fast]
+id = "model/weak"
+llm_client = "local"
+[targets.strong]
+id = "model/strong"
+llm_client = "local"
+[routes.smart]
+id = "smart"
+type = "llm_classifier"
+mode = "custom"
+models = {{ judge = ["classifier"], any = ["fast", "strong"], efficient = ["fast"], premium = ["strong"] }}
+default_target = "premium"
+prompt = "TRAINING CLASSIFIER"
+response_schema = '{{"type":"object","properties":{{"decision":{{"type":"object","properties":{{"target":{{"type":"string","enum":["efficient","premium"]}}}},"required":["target"],"additionalProperties":false}}}},"required":["decision"],"additionalProperties":false}}'
+policy = {{ type = "target_selector", selector = "/decision/target" }}
+"#,
+        upstream.base_url
+    ))?;
+    let unlogged_app = build_switchyard_router(state.clone());
+    let state = state
+        .with_routing_log(&routing_path)?
+        .with_classifier_rl_logging(&trace_path, "qwen-checkpoint-7")?;
+    let app = build_switchyard_router(state);
+    for (stream, prompt, target) in [
+        (false, "route to efficient", "model/weak"),
+        (true, "route to efficient", "model/weak"),
+        (false, "return an invalid verdict", "model/strong"),
+        (false, "fail", "model/classifier"),
+    ] {
+        let response = send_with_headers(
+            &app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": "smart", "stream": stream,
+                "messages": [{"role": "user", "content": prompt}]
+            })),
+            &[
+                ("x-switchyard-session-id", "session-7"),
+                ("x-switchyard-task-id", "task-7"),
+                ("x-switchyard-trial-id", "trial-7"),
+                ("authorization", "Bearer caller-secret-never-log"),
+            ],
+        )
+        .await?;
+        assert_eq!(
+            response.status,
+            if prompt == "fail" {
+                StatusCode::IM_A_TEAPOT
+            } else {
+                StatusCode::OK
+            }
+        );
+        let baseline = send(
+            &unlogged_app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": "smart", "stream": stream,
+                "messages": [{"role": "user", "content": prompt}]
+            })),
+        )
+        .await?;
+        assert_eq!(response.bytes, baseline.bytes);
+        assert!(baseline.headers.get("x-switchyard-decision-id").is_none());
+        let id = response.headers["x-switchyard-decision-id"].to_str()?;
+        let text = std::fs::read_to_string(&trace_path)?;
+        assert!(!text.contains("caller-secret-never-log"));
+        let events: Vec<Value> = text
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<Result<_, _>>()?;
+        let events: Vec<_> = events.iter().filter(|e| e["decision_id"] == id).collect();
+        assert!(events.iter().all(|e| e["session_id"] == "session-7"
+            && e["task_id"] == "task-7"
+            && e["policy_version"] == "qwen-checkpoint-7"));
+        let classifier_input = events
+            .iter()
+            .find(|e| e["event"] == "call_started" && e["target"] == "model/classifier")
+            .ok_or("missing classifier input")?;
+        assert!(
+            classifier_input["request"]
+                .to_string()
+                .contains("TRAINING CLASSIFIER")
+        );
+        let classifier_output = events
+            .iter()
+            .find(|e| e["event"] == "call_completed" && e["target"] == "model/classifier")
+            .ok_or("missing classifier output")?;
+        assert_eq!(classifier_input["call_id"], classifier_output["call_id"]);
+        if prompt == "fail" {
+            assert!(classifier_output["response"].is_null());
+            assert!(classifier_output["error"].as_str().is_some());
+        } else {
+            assert!(classifier_output["response"].is_object());
+            let decision = events
+                .iter()
+                .find(|e| e["event"] == "routing_decision")
+                .ok_or("missing decision")?;
+            assert_eq!(decision["selected_target"], target);
+            assert!(decision["action_probability"].is_null());
+        }
+        let finished: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "execution_completed")
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert!(finished[0]["reward"].is_null());
+        if prompt != "fail" {
+            assert_eq!(finished[0]["status"], "completed");
+            assert_eq!(finished[0]["target"], target);
+            assert!(finished[0]["response"].is_object());
+            assert!(finished[0]["usage"]["output_tokens"].as_u64().unwrap_or(0) > 0);
+        } else {
+            assert_eq!(finished[0]["status"], "error");
+        }
+        let routing = std::fs::read_to_string(&routing_path)?;
+        assert!(
+            routing
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|record| record["decision_id"] == id && record["model"] == target)
+        );
+    }
+    Ok(())
+}

@@ -127,3 +127,63 @@ fn dry_run_rejects_unsendable_configured_headers() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn classifier_rl_flags_are_opt_in_and_accept_independent_pricing() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let config = directory.path().join("routes.toml");
+    let trace = directory.path().join("events.jsonl");
+    let prices = directory.path().join("prices.json");
+    fs::write(
+        &prices,
+        r#"{"model":{"input":1,"output":2,"cache_read":0.1,"cache_write":1}}"#,
+    )?;
+    fs::write(
+        &config,
+        r#"
+schema_version = 1
+[llm_clients.local]
+format = "openai_chat"
+base_url = "http://127.0.0.1:1/v1"
+[targets.model]
+id = "model"
+llm_client = "local"
+[routes.direct]
+id = "direct"
+type = "passthrough"
+target = "model"
+"#,
+    )?;
+    let command = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_switchyard-server"));
+        c.arg("--config")
+            .arg(&config)
+            .arg("--dry-run")
+            .current_dir(directory.path());
+        c
+    };
+    assert!(command().output()?.status.success());
+    assert!(!directory.path().join("classifier_rl_data").exists());
+    let output = command()
+        .arg("--classifier-rl-log-file")
+        .arg(&trace)
+        .output()?;
+    assert!(!output.status.success());
+    assert!(!trace.exists());
+    let output = command()
+        .arg("--enable-classifier-rl-logging")
+        .arg("--classifier-rl-log-file")
+        .arg(&trace)
+        .arg("--classifier-rl-policy-version")
+        .arg("qwen-test")
+        .arg("--pricing-file")
+        .arg(&prices)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&trace)?, "");
+    Ok(())
+}

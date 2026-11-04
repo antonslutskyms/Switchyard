@@ -43,3 +43,8 @@ pub enum RunObservation {
 /// runs may invoke the same observer concurrently, so implementations must be
 /// thread-safe, fast, and non-blocking.
 pub type RunObserver = Arc<dyn Fn(RunObservation) + Send + Sync>;
+
+/// Opt-in content-bearing training events. Payloads contain normalized requests and
+/// responses, never HTTP metadata. Hosts must redact credentials before persistence.
+/// Action propensities and task rewards are unknown unless supplied by a trainer.
+pub type ClassifierRlObserver = Arc<dyn Fn(serde_json::Value) + Send + Sync>;
